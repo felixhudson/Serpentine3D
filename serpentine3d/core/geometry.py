@@ -2679,28 +2679,125 @@ def shell_solid(shape, thickness: float,
     Corners stay sharp: the walls are extended until they meet rather than
     rounded off (the kernel's default), so a star shells to a star. Rounding
     them is a fillet, done afterwards if wanted.
+
+    The kernel can report success and hand the solid back unhollowed: every
+    face of an arc closed by a flat edge, the inner walls of a U, a flat
+    running tangent into a curve. Whatever it returns is therefore measured,
+    and when nothing was taken away the cavity is cut out instead.
     """
+    if shape_kind(shape) != "solid":
+        raise GeometryError("Shell needs a closed solid")
+    t = abs(float(thickness))
+    faces = faces_of(shape)
+    picked = []
+    for idx in sorted(set(open_faces)):
+        if not 0 <= idx < len(faces):
+            raise GeometryError("That face is not on the solid")
+        picked.append(faces[idx])
+    result = _thick_solid(shape, picked, t)
+    if result is None or not _is_hollowed(shape, result):
+        result = _carved_shell(shape, picked, t)
+    return result
+
+
+def _is_hollowed(shape, result) -> bool:
+    """Whether a shell really took material away and is a sound solid."""
+    return (is_valid(result)
+            and 0 < volume(result) < volume(shape) * (1 - 1e-6))
+
+
+def _thick_solid(shape, picked: list, thickness: float):
+    """The kernel's own shell, or None when it could not make one."""
     from OCP.BRepOffset import BRepOffset_Mode
     from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeThickSolid
     from OCP.GeomAbs import GeomAbs_JoinType
     from OCP.TopTools import TopTools_ListOfShape
-    if shape_kind(shape) != "solid":
-        raise GeometryError("Shell needs a closed solid")
-    faces = faces_of(shape)
     removed = TopTools_ListOfShape()
-    for idx in sorted(set(open_faces)):
-        if not 0 <= idx < len(faces):
-            raise GeometryError("That face is not on the solid")
-        removed.Append(faces[idx])
+    for face in picked:
+        removed.Append(face)
     mk = BRepOffsetAPI_MakeThickSolid()
-    mk.MakeThickSolidByJoin(shape, removed,
-                            -abs(float(thickness)), tol(),
-                            BRepOffset_Mode.BRepOffset_Skin, False, False,
-                            GeomAbs_JoinType.GeomAbs_Intersection)
+    try:
+        mk.MakeThickSolidByJoin(shape, removed, -thickness, tol(),
+                                BRepOffset_Mode.BRepOffset_Skin, False, False,
+                                GeomAbs_JoinType.GeomAbs_Intersection)
+    except Exception:
+        return None
+    # a null shape must stop here: measuring one kills the process
     if not mk.IsDone() or mk.Shape().IsNull():
+        return None
+    return mk.Shape()
+
+
+def _inward_offset(shape, thickness: float):
+    """The solid shrunk by a distance, and the builder that made it.
+
+    Intersection keeps inside corners sharp but gives up on most curved
+    faces; arcs only round the corners that point into the solid, so a
+    profile with none loses nothing by falling back to them.
+    """
+    from OCP.BRepOffset import BRepOffset_Mode
+    from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeOffsetShape
+    from OCP.GeomAbs import GeomAbs_JoinType
+    for join, inter in ((GeomAbs_JoinType.GeomAbs_Intersection, False),
+                        (GeomAbs_JoinType.GeomAbs_Arc, False),
+                        (GeomAbs_JoinType.GeomAbs_Arc, True)):
+        mk = BRepOffsetAPI_MakeOffsetShape()
+        try:
+            mk.PerformByJoin(shape, -thickness, tol(),
+                             BRepOffset_Mode.BRepOffset_Skin, inter, False,
+                             join)
+        except Exception:
+            continue
+        if not mk.IsDone() or mk.Shape().IsNull():
+            continue
+        if _is_hollowed(shape, mk.Shape()):
+            return mk.Shape(), mk
+    raise GeometryError("Shell failed (thickness may exceed the solid's "
+                        "smallest feature)")
+
+
+def _thicken_face(face, distance: float) -> TopoDS_Shape:
+    """A solid swept from a face along its own normals."""
+    from OCP.BRepOffset import BRepOffset_MakeOffset, BRepOffset_Mode
+    from OCP.GeomAbs import GeomAbs_JoinType
+    mk = BRepOffset_MakeOffset()
+    try:
+        mk.Initialize(face, distance, tol(), BRepOffset_Mode.BRepOffset_Skin,
+                      False, False, GeomAbs_JoinType.GeomAbs_Intersection,
+                      True)
+        mk.MakeOffsetShape()
+    except Exception as exc:
+        raise GeometryError("Shell failed at the opening") from exc
+    if not mk.IsDone() or mk.Shape().IsNull():
+        raise GeometryError("Shell failed at the opening")
+    return mk.Shape()
+
+
+def _carved_shell(shape, picked: list, thickness: float) -> TopoDS_Shape:
+    """Shell by subtraction: take away the solid shrunk by the wall, then a
+    plug through the wall at each open face.
+
+    The plug is what lies both under the open face and over its image on
+    the shrunken solid, so the opening stops at the walls either side, and
+    a wall meeting it at an inside corner keeps its full thickness.
+    """
+    inner, offset = _inward_offset(shape, thickness)
+    past = thickness * 1.01
+    result = boolean_difference(shape, inner)
+    for face in picked:
+        images = list(offset.Modified(face)) or list(offset.Generated(face))
+        if not images:
+            raise GeometryError("Shell failed (thickness may exceed the "
+                                "solid's smallest feature)")
+        under = _thicken_face(face, -past)
+        for image in images:
+            plug = boolean_intersection(under, _thicken_face(image, past))
+            result = boolean_difference(result, plug)
+    result = merge_coplanar_faces(result)
+    if not _is_hollowed(shape, result):
         raise GeometryError("Shell failed (thickness may exceed the "
                             "solid's smallest feature)")
-    return mk.Shape()
+    return result
 
 
 def patch_surface(curves: list, continuity: int = 0) -> TopoDS_Shape:

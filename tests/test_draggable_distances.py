@@ -314,6 +314,69 @@ def test_shell_keeps_sharp_corners_sharp():
     assert g.volume(shelled) < g.volume(star)
 
 
+def _half_disc():
+    """A U arc closed by one flat edge across the top, extruded 10."""
+    return g.extrude(g.join_curves([
+        g.make_arc_3pt((-10, 0, 0), (0, -10, 0), (10, 0, 0)),
+        g.make_line((10, 0, 0), (-10, 0, 0))]), (0, 0, 1), 10, cap=True)
+
+
+def _square_u():
+    """20 wide, 20 tall, 5 thick arms and floor, extruded 10."""
+    return g.extrude(g.make_polyline(
+        [(0, 0, 0), (20, 0, 0), (20, 20, 0), (15, 20, 0), (15, 5, 0),
+         (5, 5, 0), (5, 20, 0), (0, 20, 0)], closed=True),
+        (0, 0, 1), 10, cap=True)
+
+
+def test_shell_hollows_every_face_of_an_arc_with_a_flat_edge():
+    """The kernel reports success here and returns the solid untouched, so
+    nothing is hollowed and nothing says why."""
+    solid = _half_disc()
+    for i in range(len(g.faces_of(solid))):
+        shelled = g.shell_solid(solid, 1, [i])
+        assert g.is_valid(shelled)
+        assert g.volume(shelled) < 0.5 * g.volume(solid)
+
+
+def test_shell_opens_a_cap_of_an_arc_with_a_flat_edge_to_the_right_depth():
+    solid = _half_disc()
+    top = g.face_index_near(solid, (0, -5, 10))
+    # the inside is the part of a radius 9 circle below y = -1, 9 deep
+    inside = 81 * math.acos(1 / 9) - math.sqrt(80)
+    assert g.volume(g.shell_solid(solid, 1, [top])) == pytest.approx(
+        g.volume(solid) - inside * 9, rel=1e-3)
+
+
+def test_shell_opens_the_inner_floor_of_a_u():
+    """The walls either side meet it at inside corners and keep their full
+    thickness: the opening is the floor, no wider."""
+    solid = _square_u()
+    floor = g.face_index_near(solid, (10, 5, 5))
+    shelled = g.shell_solid(solid, 1, [floor])
+    # the closed void, 144 x 8, plus the 10 x 1 x 8 slot through the floor
+    assert g.volume(shelled) == pytest.approx(2500 - 144 * 8 - 80, rel=1e-6)
+    assert g.distance_point_to_shape(shelled, (10, 5, 5)) > 0.9
+
+
+def test_shell_opens_a_flat_running_tangent_into_a_curve():
+    solid = g.extrude(g.join_curves([
+        g.make_line((-10, 20, 0), (-10, 0, 0)),
+        g.make_arc_3pt((-10, 0, 0), (0, -10, 0), (10, 0, 0)),
+        g.make_line((10, 0, 0), (10, 20, 0)),
+        g.make_line((10, 20, 0), (-10, 20, 0))]), (0, 0, 1), 10, cap=True)
+    side = g.face_index_near(solid, (-10, 10, 5))
+    shelled = g.shell_solid(solid, 1, [side])
+    assert g.is_valid(shelled)
+    assert g.volume(shelled) < 0.4 * g.volume(solid)
+
+
+def test_shell_says_so_when_the_wall_is_too_thick():
+    """It used to take the process down measuring a null offset."""
+    with pytest.raises(g.GeometryError):
+        g.shell_solid(_half_disc(), 50, [2])
+
+
 def test_shell_opens_every_held_face(env):
     """Ctrl+Shift-clicked faces are all opened, with no prompt for one."""
     scene, sel, _hist, _ctx, proc = env
