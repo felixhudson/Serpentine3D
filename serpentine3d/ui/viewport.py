@@ -1137,10 +1137,26 @@ class _Batch:
     mesh_ready = True
 
     def __init__(self, meshes, key):
-        self.mesh = merged(meshes)
-        self.gpu = _GpuObject(self.mesh, share_id=key)
+        mesh = merged(meshes)
+        self.gpu = _GpuObject(mesh, share_id=key)
+        # Once it is on the card only its box is asked for, by `_cull`,
+        # so the merged arrays go: kept, every small object in the file
+        # would be held twice over.
+        self.mesh = _Box(mesh.bounds())
         self.look = None
         self.last_draw = 0
+
+
+class _Box:
+    """A mesh's bounds and nothing else, for a batch that let its mesh go."""
+
+    __slots__ = ("_bounds",)
+
+    def __init__(self, bounds):
+        self._bounds = bounds
+
+    def bounds(self):
+        return self._bounds
 
 
 class _LineBatch:
@@ -2831,12 +2847,13 @@ class Viewport(QOpenGLWidget):
         picked = {sub[0] for sub in self.selection.subobjects}
         looks = {}
         items, run, run_look = [], [], None
+        built = []
 
         def finish():
             if len(run) < 2:
                 items.extend(obj for obj, _gpu in run)
             else:
-                items.append(self._batch_of(run, run_look))
+                items.append(self._batch_of(run, run_look, built))
             run.clear()
 
         for obj in objects:
@@ -2846,6 +2863,7 @@ class Viewport(QOpenGLWidget):
                     and obj.kind in BATCH_KINDS and not obj.material
                     and obj.clip_plane is None and not obj.annotation
                     and obj.id not in picked
+                    and obj.id not in self._flashes
                     and not self._looks_selected(obj.id)):
                 locked = obj.locked or obj.layer_id in locked_layers
                 key = (tuple(obj.color or ()), obj.layer_id, obj.print_width,
@@ -2866,19 +2884,40 @@ class Viewport(QOpenGLWidget):
                     or len(run) >= BATCH_MAX_OBJECTS):
                 finish()
         finish()
+        if built:
+            self._retire_outgrown(built)
         self._retire_batches()
         return items
 
-    def _batch_of(self, run, look) -> _Batch:
+    def _batch_of(self, run, look, built) -> _Batch:
         """The batch for a run, built the first time it is seen."""
         key = tuple(gpu.mesh_key for _obj, gpu in run)
         batch = self._batches.get(key)
         if batch is None:
             batch = _Batch([obj.mesh for obj, _gpu in run], key)
             self._batches[key] = batch
+            built.append(key)
         batch.look = look
         batch.last_draw = self._batch_draws
         return batch
+
+    def _retire_outgrown(self, built):
+        """Give back, straight away, the batches that new ones in `built`
+        leave with nothing to draw: one holding a mesh that has gone, by a
+        delete or an edit, and the shorter run a new one grew out of, as a
+        file loads in waves. Only a batch this draw passed over goes, and
+        never for a longer run: a sheet whose details show different parts
+        of a run builds the long one once and keeps it."""
+        live = {gpu.mesh_key for gpu in self._gpu.values()}
+        grown = {}
+        for key in built:
+            grown.setdefault(key[0], []).append(key)
+        for key in [k for k, b in self._batches.items()
+                    if b.last_draw != self._batch_draws
+                    and (not live.issuperset(k)
+                         or any(len(k) < len(new) and new[:len(k)] == k
+                                for new in grown.get(k[0], ())))]:
+            self._batches.pop(key).gpu.release()
 
     def _retire_batches(self):
         """Give back the batches that have stopped being drawn, now and then

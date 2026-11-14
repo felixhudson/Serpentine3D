@@ -11,6 +11,9 @@ batched frame and an object-at-a-time frame were compared pixel by pixel on a
 real GPU when this was written, which no test here can do.
 """
 
+import gc
+import weakref
+
 import numpy as np
 import pytest
 
@@ -207,6 +210,24 @@ def test_a_picked_face_keeps_its_object_out(gl):
     assert any(i is odd for i in _items(view))
 
 
+def test_a_flashing_object_keeps_out_so_the_flash_shows(gl):
+    """Join and Explode light what they made white for a moment. A batch
+    has one colour for everything in it, so it has no way to show that."""
+    view = _view(9)
+    lit = view.scene.all()[4]
+    view.flash([lit.id])
+    assert lit in _items(view)
+
+
+def test_a_flash_that_is_over_lets_its_object_back_in(gl):
+    view = _view(9)
+    lit = view.scene.all()[4]
+    view.flash([lit.id])
+    view._flashes[lit.id] -= 10.0
+    view._flash_tick()
+    assert lit not in _items(view)
+
+
 def test_letting_go_of_an_object_gives_the_same_batches_back(gl):
     view = _view(40)
     before = {id(b) for b in _batches(_items(view))}
@@ -291,6 +312,72 @@ def test_batches_nobody_draws_are_given_back(gl):
     for _ in range(vp_mod.BATCH_KEEP_DRAWS * 2 + 1):
         _items(view)
     assert not view._batches
+
+
+def test_a_batch_does_not_keep_its_merged_mesh_once_uploaded(gl, monkeypatch):
+    """The card holds the batch. Holding the merged arrays as well would
+    keep every small object's geometry twice over."""
+    made = []
+
+    def merging(meshes):
+        mesh = merged(meshes)
+        made.append(weakref.ref(mesh))
+        return mesh
+
+    monkeypatch.setattr(vp_mod, "merged", merging)
+    view = _view(70)
+    items = _items(view)
+    gc.collect()
+    assert made and all(ref() is None for ref in made)
+    assert len(view._cull(_matrices(view)[0], items)) == len(items)
+
+
+def test_a_batch_off_screen_is_still_culled(gl):
+    view = _view(70)
+    items = _items(view)
+    view.camera.target = np.array([0.0, 0.0, -10_000.0])
+    view.camera.distance = 5.0
+    assert not _batches(view._cull(_matrices(view)[0], items))
+
+
+def test_objects_arriving_in_waves_leave_no_old_batches_behind(gl):
+    """A file loads in waves, and each wave lengthens the run the last one
+    ended in. The batch it grew out of is never drawn again."""
+    view = _view(0)
+    for wave in range(8):
+        for i in range(25):
+            x = (wave * 25 + i) * 3.0
+            view.scene.add(g.make_box((x, 0.0, 0.0), 1.0, 1.0, 1.0))
+        _sync(view)
+        items = _items(view)
+    in_use = {b.gpu._share_key[1] for b in _batches(items)}
+    assert set(view._batches) == in_use
+
+
+def test_a_deleted_objects_batch_is_given_back_at_once(gl):
+    view = _view(70)
+    _items(view)
+    gone = view.scene.all()[30]
+    uid = gone.mesh.uid
+    view.scene.remove(gone.id)
+    _sync(view)
+    _items(view)
+    assert not [key for key in view._batches if uid in key]
+
+
+def test_details_showing_different_objects_keep_their_batches(gl):
+    """A sheet draws each of its details through one viewport. One that
+    leaves out the end of a run must not cost the other its batch on
+    every frame."""
+    view = _view(40)
+    everything = view.scene.visible_objects()
+    fewer = everything[:20] + everything[25:]
+    for objects in (fewer, everything, fewer, everything):
+        view._batched(objects, set(), "shaded", False)
+    held = gpu_share.count()
+    for objects in (fewer, everything, fewer, everything):
+        view._batched(objects, set(), "shaded", False)
+    assert gpu_share.count() == held
 
 
 def test_a_lost_context_lets_go_of_the_batches(gl):
